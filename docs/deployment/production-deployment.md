@@ -14,15 +14,15 @@ flowchart TB
     end
 
     subgraph host["Linux host: Docker Compose"]
-        frontend["<b>afry_lms_frontend</b><br/>Nginx :8080<br/><i>SPAs, uploaded files, /api proxy</i>"]
+        frontend["<b>afry_lms_frontend</b><br/>Nginx :8080<br/><i>SPAs, uploaded files, /api proxy;<br/>package files on the content host</i>"]
         backend["<b>afry_lms_backend</b><br/>Node 24 / Express :3200"]
         db[("<b>afry_lms_db</b><br/>PostgreSQL 18 :5432")]
         uploads[("<b>uploads_data</b><br/>volume")]
         migrate["<b>migrate</b><br/><i>one-shot, every up</i>"]
     end
 
-    user -- "HTTPS :443" --> proxy
-    user -- "HTTPS :443" --> agw
+    user -- "HTTPS :443, both names" --> proxy
+    user -- "HTTPS :443, both names" --> agw
     proxy -- "HTTP 127.0.0.1:8081" --> frontend
     agw -- "HTTP private IP:8081" --> frontend
     frontend -- "/api/" --> backend
@@ -52,12 +52,12 @@ The three long-running containers and the one-shot `migrate` container are pulle
 ## Prerequisites
 
 - Linux server (Ubuntu 26.04 LTS recommended)
-- Domain name with an A record pointing to the server IP
+- Two DNS names with an A record pointing to the server IP: the app's (`yourdomain.com`) and the content host packages are served from (`content.yourdomain.com`). See [Content origin](#content-origin)
 - Port 443 open in the firewall (`APP_PORT`, the port the AFRY LMS container binds to, is localhost-only and must not be exposed externally)
 - Docker 24+ with the Compose plugin
 - `sudo` rights on the server
 - The image pull token from the AFRY LMS team (see [step 4](#4-authenticate-with-ghcr)). No GitHub account is needed
-- Outbound HTTPS to `github.com` and `*.githubusercontent.com` (release files) and `ghcr.io` (images). The full list, including email, AI and certificates, is in [Server requirements](./server-requirements.md#outbound)
+- Outbound HTTPS to `github.com` and `*.githubusercontent.com` (release files) and `ghcr.io` (images), or a registry of your own: see [Using your own registry](#using-your-own-registry). The full list, including email, AI and certificates, is in [Server requirements](./server-requirements.md#outbound)
 - `curl` and `openssl` (both preinstalled on Ubuntu), plus `gpg` and `rsync` for the [backup scripts](./backup-and-recovery.md)
 - A separate data disk, if you follow [Encryption at rest](#encryption-at-rest). Plan it before the first start: moving Docker's data afterwards means migrating the volumes
 
@@ -83,14 +83,15 @@ The release files are public. No GitHub account and no login are needed. They ar
 
 - `docker-compose.yml`
 - `env.prod.example`
-- `backup.sh`, `restore.sh`, `backup-healthcheck.sh` (place these in `/srv/afry_lms/scripts/` and `chmod +x` — see the [Backup & Recovery runbook](./backup-and-recovery.md))
+- `backup.sh`, `restore.sh`, `backup-healthcheck.sh`, `verify-backup.sh` (place these in `/srv/afry_lms/scripts/` and `chmod +x` — see the [Backup & Recovery runbook](./backup-and-recovery.md))
 - `rotate-secret.sh`, in the same directory (see [Rotating secrets](#rotating-secrets))
+- `digests.txt`, `cosign.pub` and one `*.cdx.json` SBOM per image, for checking the images (see [Verifying the images](#verifying-the-images))
 
 ```bash
 BASE=https://github.com/xavier-follet/afry-lms-releases/releases/latest/download
 mkdir -p scripts
 for f in docker-compose.yml env.prod.example; do curl -fsSLo "$f" "$BASE/$f"; done
-for f in backup.sh restore.sh backup-healthcheck.sh rotate-secret.sh; do curl -fsSLo "scripts/$f" "$BASE/$f"; done
+for f in backup.sh restore.sh backup-healthcheck.sh verify-backup.sh rotate-secret.sh; do curl -fsSLo "scripts/$f" "$BASE/$f"; done
 chmod +x scripts/*.sh
 ```
 
@@ -112,11 +113,14 @@ JWT_SECRET=<output of: openssl rand -hex 32>
 FILE_TOKEN_SECRET=<output of: openssl rand -hex 32>
 SCORM_CONTEXT_SECRET=<output of: openssl rand -hex 32>
 CORS_ORIGIN=https://yourdomain.com
+CONTENT_HOST=content.yourdomain.com
 # Needed for email or AI. Leave it empty if you use neither, never as the placeholder
 SMTP_ENCRYPTION_KEY=<output of: openssl rand -hex 32>
 ```
 
 > **Upgrading an existing install?** Add `SCORM_CONTEXT_SECRET` to `.env` before running `docker compose up -d` on the new release. Compose stops with an error if it is missing, and nothing on the running stack changes.
+>
+> Set `CONTENT_HOST` too, with a DNS record and a reverse-proxy site for it: see [Content origin](#content-origin). Without it, SCORM and HTML packages run on the app's own address, with the viewer's session in their reach.
 >
 > The backend also refuses to start on a placeholder, short or malformed secret, or on the default database password. If it keeps restarting after an upgrade, `docker compose logs backend` names the variable. See [Startup checks](#startup-checks). The fix depends on which one it is:
 >
@@ -134,22 +138,74 @@ echo YOUR_TOKEN | docker login ghcr.io -u afry-lms-customer --password-stdin
 
 The username is not checked; any non-empty value works. This is a one-time step. Docker stores the credential in `~/.docker/config.json`.
 
+If the server pulls from your own registry instead, log in to that one: see [Using your own registry](#using-your-own-registry).
+
 ### 5. Pull images and start
+
+To check that the images are the ones AFRY LMS signed before you run them, follow
+[Verifying the images](#verifying-the-images) first.
 
 ```bash
 docker compose up -d
 ```
 
-On first start, PostgreSQL creates an empty database. The `migrate` service then builds the schema by applying every migration in order (starting from `0001_initial_schema.sql`), and the backend starts only after it has finished. There is no seed data: the backend creates the superadmin from `SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD` if none exists yet. Every later `docker compose up` runs `migrate` again, which applies only the migrations that are new.
+Then pull the small `alpine` image that `backup.sh` and `restore.sh` copy the uploads volume
+with. The scripts pin it by digest, and pulling it now means a backup never has to reach
+Docker Hub (see [The helper image](./backup-and-recovery.md#the-helper-image), which also
+covers hosts without internet):
+
+```bash
+docker pull "$(grep -o 'alpine:[0-9.]*@sha256:[0-9a-f]*' scripts/backup.sh)"
+```
+
+On first start, PostgreSQL creates an empty database. The `migrate` service then builds the schema by applying every migration in order (starting from `0001_initial_schema.sql`), and the backend starts only after it has finished. There is no seed data: the backend creates the superadmin from `SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD` if none exists yet. That password works once: the first sign-in with it goes straight to **Set a new password**, and the account must choose its own before it gets in. The backend log says `Superadmin created` only when it actually created the account; if the email already belongs to a user who is not a super-user, it logs a warning and creates nothing. Every later `docker compose up` runs `migrate` again, which applies only the migrations that are new.
 
 ### 6. Verify
 
 ```bash
 docker compose ps -a                   # postgres, backend, frontend "Up"; migrate "Exited (0)"
 curl http://localhost:8081/api/version # → {"app":"v1.2.3","db":"…","externalFonts":"bunny"}
+curl -f http://localhost:8081/api/health # → {"status":"ok"}
 ```
 
+`/api/version` always answers 200; `"db": null` there means the backend cannot reach the database. For a check that depends only on the status code (a load-balancer probe, a monitoring tool), use `/api/health`: 200 when the database answers, 500 when it does not or takes more than 3 seconds.
+
 The backend's port 3200 is not published to the host, so check it through the frontend on `APP_PORT`. That also proves the Nginx-to-backend proxy works. A `migrate` container with a non-zero exit code means a migration failed, and the backend will not have started: see `docker compose logs migrate`.
+
+---
+
+## Content origin
+
+Imported SCORM courses and HTML packages are uploaded by course producers, and they run
+whatever script their author wrote. AFRY LMS serves them from a second host name of their
+own, `CONTENT_HOST`, so that the browser keeps them apart from the app: a package can script
+its own frames, which authoring tools such as Rise and Storyline need, but it cannot read
+the session of the learner viewing it, call the API as them, or reach the page around it.
+
+- **Pick a name under the app's own domain**, e.g. `content.yourdomain.com` for
+  `yourdomain.com`. Browsers then treat the two as one site, and packages keep their own
+  cookies. Two unrelated domains work as well, but some browsers then refuse packages'
+  cookies.
+- **Point it at the same server** with an A record, and give your reverse proxy a site and
+  certificate for it, as in the options below. Nothing else changes: the same containers
+  serve both names, and the frontend's Nginx answers on the content host with package files
+  only, never the app.
+- **Azure-provided names** (`<label>.<region>.cloudapp.azure.com`) cannot carry a second
+  name beneath them; use a domain of your own for both names.
+
+Set it in `.env` as the host name alone, without `https://`:
+
+```env
+CONTENT_HOST=content.yourdomain.com
+```
+
+> **Leaving `CONTENT_HOST` empty is a security decision**, and so is setting it to the app's
+> own host name (with any port: ports do not separate them). Packages are then served from
+> the app's own address, where any script inside one can read the session of whoever views
+> it and act in the platform as them: an author with upload rights could take over a
+> super-user's account by getting them to open a page. Choose this only for an installation
+> where every package uploaded to it comes from someone you trust. The backend logs a
+> warning at every start while it is empty.
 
 ---
 
@@ -182,9 +238,9 @@ curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
 sudo apt update && sudo apt install caddy
 ```
 
-`/etc/caddy/Caddyfile`:
+`/etc/caddy/Caddyfile`, both names in one site:
 ```
-yourdomain.com {
+yourdomain.com, content.yourdomain.com {
     reverse_proxy localhost:8081
 }
 ```
@@ -197,20 +253,22 @@ sudo systemctl enable --now caddy
 
 ```bash
 sudo apt install -y nginx certbot python3-certbot-nginx
-sudo certbot --nginx -d yourdomain.com
+sudo certbot --nginx -d yourdomain.com -d content.yourdomain.com
 ```
+
+One certificate covers both names; Certbot keeps it under the first one.
 
 `/etc/nginx/sites-available/afry_lms`:
 ```nginx
 server {
     listen 80;
-    server_name yourdomain.com;
+    server_name yourdomain.com content.yourdomain.com;
     return 301 https://$host$request_uri;
 }
 
 server {
     listen 443 ssl http2;
-    server_name yourdomain.com;
+    server_name yourdomain.com content.yourdomain.com;
 
     ssl_certificate     /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
@@ -221,7 +279,7 @@ server {
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        client_max_body_size 200M;
+        client_max_body_size 10240M;
     }
 }
 ```
@@ -241,7 +299,9 @@ domain's DNS record points at the gateway's public IP rather than the VM.
 **1. Let the gateway reach the app.** The shipped compose file binds the app to
 `127.0.0.1`, which only the VM itself can reach. Add a second binding on the VM's
 private IP in an override file, which Compose loads automatically. Do not edit
-`docker-compose.yml`: it is replaced with each release.
+`docker-compose.yml`: it is replaced with each release. `backup.sh`, `restore.sh` and
+`rotate-secret.sh` load the override file too, so a restore or a secret rotation keeps the
+binding; each logs the compose files it uses when it starts.
 
 `/srv/afry_lms/docker-compose.override.yml`:
 ```yaml
@@ -263,13 +323,13 @@ from the Application Gateway subnet only.
 
 | Setting | Value | Why |
 |---|---|---|
-| Listener | HTTPS 443, your certificate | Replaces Caddy |
+| Listener | HTTPS 443, multi-site, one per name (your domain and `CONTENT_HOST`), each with its certificate, or one certificate covering both | Replaces Caddy |
 | Redirect | HTTP 80 to HTTPS 443 | |
 | Backend pool | The VM's private IP | |
 | Backend settings | HTTP, port 8081, **timeout 120 s** | Default 20 s is too short for SCORM imports and AI calls |
-| Override with new host name | **No** (default) | The backend must see your domain |
+| Override with new host name | **No** (default) | The backend must see the name the browser used: it tells the app and the content host apart by it |
 | Cookie-based affinity | Disabled | Tokens, no server session |
-| Health probe | `/api/version`, host = your domain, 200–399 | Checks the backend, not just Nginx |
+| Health probe | `/api/health`, host = your domain, 200–399 | 200 only when the backend reaches the database, 500 otherwise. Not `/api/version`: it always answers 200 |
 
 **If the WAF is enabled**, raise its file upload limit to at least 200 MB (the
 largest SCORM and package import), and check its request body size limit:
@@ -330,37 +390,247 @@ For unattended reboots, add an entry to `/etc/crypttab` and store the passphrase
 
 ## Updating the application
 
-Each GitHub Release publishes updated images. To deploy a new version:
+Each GitHub Release publishes updated images. Versions read `vMAJOR.MINOR.REVISION`:
 
-```bash
-# Pull and restart with the latest images
-docker compose pull
-docker compose up -d
+- **A new minor version** (`v0.3.0`) brings changes to the application: features, fixes,
+  database migrations, `.env` variables.
+- **A new revision** (`v0.3.1`) is the same application as the minor version before it, with
+  either:
+  - **refreshed base images and operating-system packages**, published monthly so security
+    fixes from upstream reach your installation. Its release notes say "No changes you would
+    notice in the application", and it has no migrations and no `.env` changes. A month in
+    which no base image or package changed has no such release.
+  - **a hotfix**: one urgent fix, listed in its release notes.
 
-# Pin to a specific release
-APP_VERSION=v1.2.3 docker compose pull
-APP_VERSION=v1.2.3 docker compose up -d
+Only the newest minor version receives these revisions. If you run an older one, upgrade to
+the newest to get them.
+
+To deploy a new version (unless its release
+notes say it moves to a new PostgreSQL major version: then follow
+[PostgreSQL major-version upgrades](#postgresql-major-version-upgrades) instead):
+
+1. **Read the release notes** of every release between the one you run and the one you
+   are moving to, in the [releases list](https://github.com/xavier-follet/afry-lms-releases/releases)
+   or its Atom feed (`/releases.atom` at the same address). Each one opens with:
+
+   - **What changed**: new features, fixes, and changes in behaviour.
+   - **Upgrade**: steps to take before upgrading, `.env` variables that are new or no
+     longer used (`env.prod.example` explains each one), and the database migrations the
+     release applies on startup. A migration that drops a table or column carries a
+     warning: that data comes back only from the backup in the next step.
+
+   The notes list what changed. They are not a guarantee that an upgrade is safe, which
+   is why the backup comes first.
+
+2. **Take a backup first**, while the current version is still running (the script
+   checks that PostgreSQL is up before it starts):
+
+   ```bash
+   sudo /srv/afry_lms/scripts/backup.sh
+   echo $?   # must print 0, and the last log line must read "backup <timestamp> complete"
+   ```
+
+   Do not continue on any other exit code. Migrations only move forward and some of
+   them drop columns or tables, so this backup is the only way back if the upgrade has
+   to be undone (see [Rolling back](#rolling-back)). For the script's settings and
+   exit codes, see [Running a backup](./backup-and-recovery.md#4-running-a-backup).
+   To also prove the backup restores, run `sudo /srv/afry_lms/scripts/verify-backup.sh latest`
+   ([Verifying a backup](./backup-and-recovery.md#10-verifying-a-backup-restore-drill)).
+
+3. **Pull and restart:**
+
+   ```bash
+   # Pull and restart with the latest images
+   docker compose pull
+   docker compose up -d
+
+   # Pin to a specific release
+   APP_VERSION=v1.2.3 docker compose pull
+   APP_VERSION=v1.2.3 docker compose up -d
+   ```
+
+   If the `docker-compose.yml` itself changed in the release, download it again before running the above.
+   To check the new images first, see [Verifying the images](#verifying-the-images). If you pin
+   images by digest, update `docker-compose.override.yml` with the new digests, or the pull
+   keeps the old release.
+
+### Rolling back
+
+There is no downgrade. Migrations only move forward, and the ones that drop data cannot
+be reversed, so the way back is the backup taken before the upgrade plus the previous
+`APP_VERSION`. The backup's manifest (`/srv/backups/afry_lms-<timestamp>.manifest`)
+records the image it was taken from on its `app_image=` line. Anything entered after
+that backup is lost.
+
+Never start an older version against a database a newer release has already migrated:
+the older code does not know the newer schema. The stack refuses to. Set `APP_VERSION`
+back without restoring and the `migrate` one-shot exits 1 before changing anything, the
+backend does not start, and `docker compose logs migrate` reads:
+
+```text
+Refusing to start: the database was migrated by a newer release. It holds
+0054_example.sql, which this image does not contain (its last migration is 0053_system_message.sql). ...
 ```
 
-If the `docker-compose.yml` itself changed in the release, download it again before running the above.
+The database is unharmed: put `APP_VERSION` back to the newer version and `docker compose up -d`
+brings the site back as it was. To roll back instead:
+
+1. Read the version the backup was taken on:
+
+   ```bash
+   grep app_image= /srv/backups/afry_lms-<timestamp>.manifest
+   # app_image=ghcr.io/<org>/<repo>/backend:v1.2.3
+   ```
+
+   The tag after the last `:` is the version. If it reads `latest`, the manifest cannot tell
+   you which release that was, which is one more reason to pin `APP_VERSION`.
+
+2. Set `APP_VERSION` in `.env` to that version and pull its images:
+
+   ```bash
+   docker compose pull
+   ```
+
+3. Restore the backup. This replaces the database and the uploaded files, then starts the
+   stack on the older images:
+
+   ```bash
+   sudo /srv/afry_lms/scripts/restore.sh <timestamp>
+   ```
+
+   The database is replaced whole, so tables a newer release added do not linger. See
+   [Restore](./backup-and-recovery.md#9-restore).
 
 ### PostgreSQL major-version upgrades
 
-A release that bumps the `db` image to a new PostgreSQL major version (as happened with
-16 to 18) is **not** a plain `pull` + `up`: PostgreSQL's on-disk format is not compatible
-across major versions, and the postgres:18+ image also changed where it expects its volume
-mounted (`/var/lib/postgresql` as a single mount, not `/var/lib/postgresql/data`) — starting
-the new image straight against an existing 16 volume fails to boot rather than silently
-corrupting anything, but it does mean downtime until you upgrade the data. Take a full
-backup ([backup-and-recovery.md](./backup-and-recovery.md)), then either:
+A release that moves the `db` image to a new PostgreSQL major version says so in its
+release notes, under a heading such as **PostgreSQL 18 to 19**. Do not install that release
+with the plain `pull` and `up` above.
 
-- **`pg_dump`/`pg_restore`** — dump from the old `db` container before switching images,
-  bring up the new image against a fresh volume, restore into it; or
-- **`pg_upgrade`** — run the old and new `postgres` binaries against the old and new data
-  directories per the [upstream image's upgrade notes](https://github.com/docker-library/postgres/issues/37).
+A PostgreSQL major version cannot read the data files of the previous one. Started on the
+existing volume, the new `db` image finds the old version's data and refuses to start:
+`docker compose ps` shows it restarting, `migrate` and the backend wait for it, and the site
+answers 502 Bad Gateway. `docker compose logs postgres` says
+`there appears to be PostgreSQL data in: /var/lib/postgresql/18/docker`. Nothing is damaged:
+set `APP_VERSION` back to the previous version, run `docker compose up -d`, and follow the
+steps below.
 
-Either way, verify the restored data (`docker compose exec postgres psql -U <user> <db> -c '\dt'`)
-before removing the old volume.
+The procedure moves the data with a dump and a restore into a new volume, using the
+backup scripts. The old volume is not touched, so until you remove it, going back is a
+matter of switching back. The application is down from step 1 until the checks in
+step 7 pass. Plan for about twice as long as your nightly backup takes (the timestamps in
+`/srv/backups/backup.log` show it).
+
+The commands run in `/srv/afry_lms`. They use the default database user and name,
+`afry_lms` and `afry_lms_db`: use your `POSTGRES_USER` and `POSTGRES_DB` if `.env` sets
+them. Check that the disk has room for a second copy of the database:
+`docker system df -v | grep postgres_data` shows the current volume's size.
+
+1. **Stop the application and back up.** Stopping `frontend` and `backend` first means
+   nothing is written after the backup. The database stays up, because the backup needs it.
+
+   ```bash
+   cd /srv/afry_lms
+   docker compose stop frontend backend
+   docker compose ps   # must list afry_lms_db only
+   sudo /srv/afry_lms/scripts/backup.sh
+   echo $?   # must print 0
+   ```
+
+2. **Record the row counts** of every table, to compare after the restore:
+
+   ```bash
+   docker compose exec -T postgres psql -U afry_lms -d afry_lms_db -tA > ~/rows-before.txt <<'SQL'
+   SELECT table_name || '=' || (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I', table_name), false, true, '')))[1]
+   FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY 1;
+   SQL
+   ```
+
+3. **Check that the backup restores into the new version** before you change anything.
+   `verify-backup.sh` restores it into a throwaway container of the image you name and
+   leaves the live data alone (see
+   [Verifying a backup](./backup-and-recovery.md#10-verifying-a-backup-restore-drill)).
+   Setting `APP_VERSION` for this one command makes it use the new release's `db` image:
+
+   ```bash
+   sudo APP_VERSION=<new version> /srv/afry_lms/scripts/verify-backup.sh latest
+   ```
+
+   It must end with a line starting `OK:`. If it does not, stop here: run
+   `docker compose up -d` and you are back on the current version.
+
+4. **Switch to the new release.** Download the new release's `docker-compose.yml`, set
+   `APP_VERSION` in `.env` to the new version, then:
+
+   ```bash
+   docker compose down     # never with -v: that deletes the volumes
+   docker compose pull
+   ```
+
+5. **Give the database a new volume.** Add this to
+   `/srv/afry_lms/docker-compose.override.yml`, creating the file if there is none, and
+   name the volume after the new major version:
+
+   ```yaml
+   volumes:
+     postgres_data:
+       name: afry_lms_postgres_data_pg19
+   ```
+
+   `docker compose config | grep postgres_data_pg` should now print that name. If the file
+   already has a `volumes:` block from an earlier upgrade, change the name in it rather than
+   adding a second block.
+
+6. **Start the new database and restore into it.** `restore.sh` then starts `migrate`, the
+   backend and the frontend:
+
+   ```bash
+   docker compose up -d --wait postgres
+   sudo /srv/afry_lms/scripts/restore.sh latest --db-only --yes
+   ```
+
+   The script's last check runs before the frontend is ready, so a warning that it did not
+   respond yet is expected.
+
+7. **Check.** All of these must hold before anyone uses the application:
+
+   ```bash
+   curl -f http://localhost:8081/api/health          # {"status":"ok"}
+   curl http://localhost:8081/api/version            # "db" names the newest migration
+   docker compose exec postgres psql -U afry_lms -d afry_lms_db -tAc 'SHOW server_version'
+   ```
+
+   A 502 in the first minute only means the backend is still starting: try again.
+
+   Run the step 2 command again with `~/rows-after.txt`, then
+   `diff ~/rows-before.txt ~/rows-after.txt` must print nothing. (When the release
+   also brings migrations, the tables they change can differ; check those against the
+   release notes.) Finally, sign in and open a training you have progress in: its media must load and it
+   must resume where you left off. If you use imported SCORM courses, launch one too.
+
+**Going back.** As long as the old volume exists: `docker compose down`, delete the
+`volumes:` block from the override file (or, after an earlier upgrade, set its name back),
+put back the previous `docker-compose.yml` and
+`APP_VERSION`, and `docker compose up -d`. The old database comes back as it was at step 1.
+Anything entered on the new version is lost.
+
+**Removing the old volume.** Once the new version has run for a few days and has its own
+backups:
+
+```bash
+docker volume rm afry_lms_postgres_data   # the name before this upgrade
+```
+
+Keep the `volumes:` block in the override file. It names the volume the database now
+lives on, and removing it would start the database on an empty volume again. On the next
+major version, change its name (`afry_lms_postgres_data_pg20`) and remove
+`afry_lms_postgres_data_pg19` at the end.
+
+**`pg_upgrade`** converts the data files in place instead of dumping and restoring them,
+which only pays off for an unusually large database, where the restore would take hours. It
+needs the old and the new PostgreSQL binaries in one container, which the `db` image does
+not provide, and with `--link` the old data cannot be started again once the new server has
+run. There is no runbook for it here: dump and restore is the supported procedure.
 
 ---
 
@@ -449,7 +719,7 @@ steps:
 
 | Secret | What it protects | Finish after |
 |---|---|---|
-| `JWT_SECRET` | Sign-in sessions | 7 days (a session lasts at most 7 days) |
+| `JWT_SECRET` | Sign-in sessions | The session lifetime under **System > Sign-In Policies** (12 hours by default, 30 days at most) |
 | `FILE_TOKEN_SECRET` | Links to private files and documents, HTML package addresses, SCORM package access | 13 hours (an HTML package address lasts up to 13 hours) |
 | `SCORM_CONTEXT_SECRET` | Running SCORM launches | 1 hour |
 | `SMTP_ENCRYPTION_KEY` | Stored SMTP passwords and AI keys | Straight away, once re-encryption succeeds |
@@ -547,7 +817,7 @@ volume was first created, so the backend can no longer connect.
 | Mistral AI key, system-wide or per organization | **System > AI** or the organization's **AI Settings**. Create the new key at Mistral, choose **Set key**, then **Test key**, then revoke the old one at Mistral |
 | GHCR token | Ask the AFRY LMS team for a new token, then run `docker login ghcr.io` again as in [Authenticate with GHCR](#4-authenticate-with-ghcr) |
 | Backup passphrase | Write a new one to `/root/.backup-passphrase`. Keep the old passphrase for as long as the backups it encrypted are retained, or they cannot be restored. See the [Backup & Recovery runbook](./backup-and-recovery.md) |
-| `SUPERADMIN_PASSWORD` | Used on first start only. Remove it from `.env` after the first sign-in, and change that account's password under **Settings** |
+| `SUPERADMIN_PASSWORD` | Used on first start only. The first sign-in with it must choose a new password before getting in. Remove it from `.env` afterwards |
 
 The in-app ones are described for administrators in the manual's *Passwords and secrets*
 article, at `/help/administration/passwords-and-secrets`.
@@ -585,6 +855,10 @@ A value counts as the placeholder when it contains `CHANGE_ME`, in any case.
 
 Read the reason with `docker compose logs backend`.
 
+The backend, and before it the `migrate` one-shot, also refuses a database that a newer
+release has migrated: see [Rolling back](#rolling-back). Under Compose, `migrate` stops first,
+so read that one with `docker compose logs migrate`.
+
 ---
 
 ## Environment variables
@@ -596,36 +870,40 @@ while `JWT_SECRET`, `FILE_TOKEN_SECRET` or `SCORM_CONTEXT_SECRET` is missing.
 
 | Variable | What it is | Example |
 |---|---|---|
-| `GITHUB_REPOSITORY` | Where the images are pulled from | `acme/afry-lms` |
+| `GITHUB_REPOSITORY` | Image path in the registry, after the host | `acme/afry-lms` |
 | `POSTGRES_PASSWORD` | Database password | strong random |
 | `JWT_SECRET` | Signs sign-in tokens | secret |
 | `FILE_TOKEN_SECRET` | Signs private-file URLs | secret |
 | `SCORM_CONTEXT_SECRET` | Signs SCORM launch contexts | secret |
 | `CORS_ORIGIN` | The public origin, exactly | `https://yourdomain.com` |
 | `PORTAL_BASE_URL` | Base of the links in emails | `https://yourdomain.com` |
+| `CONTENT_HOST` | Host name SCORM and HTML packages are served from. Empty runs them on the app's address, trusted: see [Content origin](#content-origin) | `content.yourdomain.com` |
 
 ### First run only
 
 | Variable | What it is |
 |---|---|
 | `SUPERADMIN_EMAIL` | The first super-user. Ignored once one exists |
-| `SUPERADMIN_PASSWORD` | Their password. Remove it from `.env` after the first login |
+| `SUPERADMIN_PASSWORD` | Their first password, which must be changed at the first sign-in. Remove it from `.env` afterwards |
 
 ### Optional
 
 | Variable | Default | What it does |
 |---|---|---|
 | `APP_VERSION` | `latest` | Image tag to run. Pin it, e.g. `v1.2.3` |
+| `REGISTRY` | `ghcr.io` | Registry host the images are pulled from. See [Using your own registry](#using-your-own-registry) |
 | `APP_PORT` | `8081` | Host port of the app, on `127.0.0.1`. Kept off 80 for the reverse proxy |
 | `POSTGRES_USER` | `afry_lms` | Database user |
 | `POSTGRES_DB` | `afry_lms_db` | Database name |
 | `SMTP_ENCRYPTION_KEY` | none | Encrypts stored SMTP passwords and the AI key. Needed for email or AI ¹ |
 | `JWT_SECRET_PREVIOUS`, `FILE_TOKEN_SECRET_PREVIOUS`, `SCORM_CONTEXT_SECRET_PREVIOUS`, `SMTP_ENCRYPTION_KEY_PREVIOUS` | none | The old value during a rotation. Set and removed by `rotate-secret.sh`. See [Rotating secrets](#rotating-secrets) |
 | `EXTERNAL_FONTS` | `bunny` | `off` keeps font pickers to web-safe fonts. See [Air-gapped installs](#air-gapped-and-no-egress-installs) |
-| `DEFAULT_STORAGE_QUOTA_BYTES` | unlimited | Storage quota for organizations without their own ² |
+| `DEFAULT_STORAGE_QUOTA_BYTES` | unlimited | Initial value of the default storage quota for organizations without their own. Read once ² |
 | `TRUST_PROXY` | `2` | Number of proxies in front of the backend ³ |
 | `LOG_RETENTION_MIN_DAYS` | `30` | Shortest log retention window a super-user may set ⁴ |
 | `MANUAL_PURGE_ENABLED` | `true` | `false` removes **Purge all now** from **System > Data Lifecycle Policies** |
+| `SESSION_LIFETIME_HOURS` | `12` | How long a sign-in lasts, 1 to 720 hours. Default for **System > Sign-In Policies > Sessions**, where a value set wins |
+| `SESSION_IDLE_MINUTES` | `60` | Minutes without activity before someone is signed out. `0` turns it off, otherwise 5 to 1440. Default for the same page |
 | `*_CPUS`, `*_MEMORY` | see table | Container limits. See [Resource limits](#resource-limits) |
 
 ¹ Rotate it with `scripts/rotate-secret.sh SMTP_ENCRYPTION_KEY`, which keeps stored SMTP
@@ -633,8 +911,11 @@ passwords and AI keys readable and re-encrypts them. Replacing the value in `.en
 without `SMTP_ENCRYPTION_KEY_PREVIOUS` makes every stored one unreadable. See
 [Rotating secrets](#rotating-secrets).
 
-² In bytes, e.g. `10737418240` for 10 GB. A quota set on the organization
-(**Organizations > Edit > Limits**) always wins. Empty or `0` means unlimited.
+² In bytes, e.g. `10737418240` for 10 GB. Empty or `0` means unlimited. The backend copies
+it into **System > Storage & Upload Limits** on its first start (on a new install, or on
+the first start of a release that has that field) and never reads it again, so a later
+change to `.env` has no effect: change the quota on that page instead. A quota set on the
+organization (**Storage & Upload Limits** in its **More actions** menu) always wins.
 
 ³ Count the frontend container's own Nginx plus every proxy in front of it. `2`
 fits Caddy, Nginx or Application Gateway. Add one per extra layer, e.g. `3` for
@@ -646,6 +927,161 @@ logged and ignored, and the backend then trusts one hop.
 ⁴ Applies to both the login log and the audit trail under **System > Data
 Lifecycle Policies**. A window already stored below it is treated as this value.
 Anything but a whole number of 1 or more falls back to `30`.
+
+---
+
+## Verifying the images
+
+Every release publishes these files next to the images:
+
+| File | What it is |
+|---|---|
+| `digests.txt` | The digest of each image, one `image@sha256:…` per line. A tag such as `v1.2.3` can be moved to another image; a digest names one exact image and cannot. The release notes list them too |
+| `cosign.pub` | The AFRY LMS public key the images are signed with |
+| `db.cdx.json`, `backend.cdx.json`, `frontend.cdx.json` | One SBOM per image (see [What the SBOMs are for](#what-the-sboms-are-for)) |
+
+### Checking the signatures
+
+Install [cosign](https://github.com/sigstore/cosign/releases) 3 or later on any machine that
+can pull the images. It is a single binary, and the server itself does not need it. The
+images are private, so log in with your pull token first, as in
+[step 4](#4-authenticate-with-ghcr); cosign uses the same login as Docker. Then, in a directory
+holding the release's `digests.txt` and `cosign.pub`:
+
+```bash
+while read -r ref; do
+  cosign verify --key cosign.pub --insecure-ignore-tlog "$ref"
+done < digests.txt
+```
+
+Every image must report `The signatures were verified against the specified public key`. Any
+error means the image is not the one AFRY LMS released: do not run it, and contact the
+AFRY LMS team.
+
+The images are signed with a key, not with Sigstore's keyless signing, and the signatures are
+deliberately not recorded in Sigstore's public transparency log. `--insecure-ignore-tlog`
+tells cosign not to look for them there, so the warning it prints about skipping the log is
+expected. Nothing is checked against Sigstore's services: the check needs the registry and
+nothing else.
+
+To check what a tag points at today, pass the tag instead of the digest:
+`cosign verify --key cosign.pub --insecure-ignore-tlog ghcr.io/xavier-follet/afry-lms/backend:v1.2.3`.
+
+### Checking without internet access
+
+When the machine that must do the check cannot reach the registry, save the images with
+their signatures on a connected machine:
+
+```bash
+while read -r ref; do
+  name=$(basename "${ref%@*}")   # db, backend or frontend
+  cosign save --dir "$name" "$ref"
+done < digests.txt
+```
+
+Move the three directories and `cosign.pub` across, then check them where they landed. This
+needs no network at all:
+
+```bash
+for name in db backend frontend; do
+  cosign verify --key cosign.pub --insecure-ignore-tlog --local-image "$name"
+done
+```
+
+The same directories load into a registry of your own with `cosign load`, signatures
+included: see [Using your own registry](#using-your-own-registry).
+
+### Pinning by digest
+
+`docker-compose.yml` pulls by tag (`APP_VERSION`). To run exactly the images you verified,
+pin each service to its digest in a `docker-compose.override.yml` next to it. Compose reads
+that file on its own:
+
+```yaml
+services:
+  postgres:
+    image: ghcr.io/xavier-follet/afry-lms/db@sha256:<db digest>
+  migrate:
+    image: ghcr.io/xavier-follet/afry-lms/backend@sha256:<backend digest>
+  backend:
+    image: ghcr.io/xavier-follet/afry-lms/backend@sha256:<backend digest>
+  frontend:
+    image: ghcr.io/xavier-follet/afry-lms/frontend@sha256:<frontend digest>
+```
+
+Copy the digests from `digests.txt`. With your own registry, replace `ghcr.io` with its host;
+the digests stay the same. Update the file on every upgrade: while it exists, `docker compose
+pull` keeps fetching the pinned images whatever `APP_VERSION` says.
+
+### What the SBOMs are for
+
+Each SBOM (software bill of materials) lists the operating-system and application packages
+inside one image, with their versions and licences, in CycloneDX JSON. It describes the
+`linux/amd64` image; the `linux/arm64` image is built from the same Dockerfile. Use them to
+know what you are running, to feed your own vulnerability scanner (for example
+`trivy sbom backend.cdx.json`), or for a licence review.
+
+An SBOM is an inventory, not a verdict: it does not say an image is free of vulnerabilities.
+Each release is scanned before it is published, and a HIGH or CRITICAL finding with a fix
+available stops it, but new vulnerabilities are found in old packages every day.
+
+### When the signing key changes
+
+- The private key is held by the AFRY LMS release team: in the release pipeline's secret
+  store, with one offline backup. It is not used anywhere else.
+- Every release attaches the public key it was signed with, and the current one is
+  `cosign.pub` at the root of the [releases repository](https://github.com/xavier-follet/afry-lms-releases).
+  Keep the copy you received at installation.
+- The key changes only on a planned rotation or if it may have been exposed. The AFRY LMS
+  team tells you through your usual contact before the first release signed with a new key,
+  and that release says so at the top of its release notes.
+- If a release's `cosign.pub` differs from the key you have and you were not told, do not
+  install that release; contact the AFRY LMS team.
+- Older releases remain verifiable with the `cosign.pub` attached to each of them.
+
+---
+
+## Using your own registry
+
+When the server cannot reach `ghcr.io` (no internet after installation, or a policy that
+allows only an internal registry such as Azure Container Registry), copy the images into a
+registry it can reach and point Compose at it. Images are pulled from
+`$REGISTRY/$GITHUB_REPOSITORY/<db|backend|frontend>:$APP_VERSION`.
+
+1. On a machine with [cosign](https://github.com/sigstore/cosign/releases) 3 or later, logged
+   in to both registries, copy the three images. Keep the repository path and the tag:
+   ```bash
+   SRC=ghcr.io/xavier-follet/afry-lms
+   DST=myregistry.azurecr.io/xavier-follet/afry-lms
+   for img in db backend frontend; do
+     cosign save --dir "$img" "$SRC/$img:v1.2.3"
+     cosign load --dir "$img" "$DST/$img:v1.2.3"
+   done
+   ```
+   This copies both architectures and the signatures, and keeps the digests, so
+   `digests.txt` still applies and the [signature check](#checking-the-signatures) works
+   against your registry. Do not copy with `docker pull`, `docker tag` and `docker push`:
+   that copies only your machine's architecture, gives the image a new digest, and leaves
+   the signature behind. `cosign copy` is deprecated and does not copy the signatures either.
+   When no machine reaches both registries, run `cosign save` on one side and `cosign load`
+   on the other.
+2. In `.env` on the server, set the registry host and pin the version:
+   ```env
+   REGISTRY=myregistry.azurecr.io
+   APP_VERSION=v1.2.3
+   ```
+   If your registry keeps the images under a different path, set `GITHUB_REPOSITORY` to that
+   path as well.
+3. Run `docker login myregistry.azurecr.io` on the server instead of logging in to `ghcr.io`,
+   then `docker compose pull` and `docker compose up -d`.
+
+The backup scripts use one more image, `alpine`, from Docker Hub. Copy it too (with `docker buildx imagetools create`) and
+set `BACKUP_HELPER_IMAGE`: see [The helper image](./backup-and-recovery.md#the-helper-image).
+
+Repeat step 1 for every release before [updating](#updating-the-application). Use `REGISTRY`
+rather than setting `image:` in `docker-compose.override.yml`: it is one line, and it applies
+to all four services. The exception is [pinning by digest](#pinning-by-digest), which needs
+the override file anyway.
 
 ---
 
@@ -694,13 +1130,22 @@ This is a per-installation decision, not a per-customer one, which is why it is 
 environment variable and not a setting in the UI. See [docs/font-policy.md](../font-policy.md)
 for the reasoning.
 
+### The backup helper image
+
+`backup.sh` and `restore.sh` need one image the stack itself does not run: a pinned `alpine`
+from Docker Hub. On a host without internet, `docker load` it from a machine that has
+internet and name it in `BACKUP_HELPER_IMAGE`, as described in
+[The helper image](./backup-and-recovery.md#the-helper-image). Do not run
+`docker image prune -a` or `docker system prune -a` on the host afterwards: they delete it,
+and the next backup then stops with exit code `2`.
+
 ---
 
 ## Ports reference
 
 | Container | Port | Reachable from | Serves |
 |---|--:|---|---|
-| `afry_lms_frontend` | 8081 | `127.0.0.1` only (`APP_PORT`) | The SPAs and uploaded files. Proxies `/api/` and package files to the backend |
+| `afry_lms_frontend` | 8081 | `127.0.0.1` only (`APP_PORT`) | The SPAs and uploaded files. Proxies `/api/` to the backend, and on `CONTENT_HOST` only package files |
 | `afry_lms_backend` | 3200 | Docker network only | The REST API |
 | `afry_lms_db` | 5432 | Docker network only | PostgreSQL |
 

@@ -20,7 +20,8 @@ no repository access is needed:
 | `afry_lms_db` | `db` | Stock PostgreSQL 18 | always |
 | `migrate` | `backend` | Builds the schema, applies new migrations, exits | on every `up` |
 
-Images are `ghcr.io/xavier-follet/afry-lms/<image>`. A **reverse proxy** you provide
+Images are `ghcr.io/xavier-follet/afry-lms/<image>`, or a copy in your own registry set by
+`REGISTRY` (see [Using your own registry](./production-deployment.md#using-your-own-registry)). A **reverse proxy** you provide
 terminates TLS: Caddy or Nginx on the host, or Azure Application Gateway in front
 of the VM. Sign-in is stateless JWT, so there is **no Redis, session store or
 cache tier**. All persistent state lives in **two Docker volumes**.
@@ -144,6 +145,7 @@ needs the runtime and operational tooling below.
 | `tar`, `gzip`, coreutils | any | Backup archives | preinstalled |
 | `mailutils` | any | *Optional:* cron failure mail | `apt install mailutils` |
 | `gh` or `curl` | any | *Optional:* downloading release files | `apt install gh` |
+| `cosign` | 3+ | *Optional:* checking image signatures. Any machine that can pull the images will do | single binary from [sigstore/cosign releases](https://github.com/sigstore/cosign/releases) |
 
 ¹ The old `docker-compose` v1 silently ignores the resource limits. Check with
 `docker compose version`.
@@ -160,11 +162,16 @@ database.
 |---|---|---|---|--:|
 | `db` | `postgres:18` (Debian) | PostgreSQL 18, nothing added | `postgres` | 5432 |
 | `backend` | `node:24-alpine` | Node.js 24, Chromium for PDFs, no `npm` | `node` | 3200 |
-| `frontend` | `nginx-unprivileged:1.27-alpine` | Nginx 1.27, the built SPAs | `nginx` (101) | 8080 |
+| `frontend` | `nginx-unprivileged:stable-alpine` | Nginx (current stable branch), the built SPAs | `nginx` (101) | 8080 |
 
 - Backend and frontend run as non-root. All three are built for **`linux/amd64`
   and `linux/arm64`**.
 - Every release is **Trivy-scanned**; a HIGH or CRITICAL finding fails the build.
+- **Supply chain:** every release lists each image's **digest** (`digests.txt`), attaches a
+  **CycloneDX SBOM** per image, and **signs** each image by digest with the AFRY LMS cosign
+  key (`cosign.pub`). The signatures are key-based and not in Sigstore's public log, so they
+  can be checked with no internet access. Only an image that passed its scan is signed or
+  tagged. See [Verifying the images](./production-deployment.md#verifying-the-images).
 - The frontend has `VITE_API_URL` baked in **at build time** when that CI secret
   is set; a domain change then needs a new release. Left empty, the frontend calls
   `/api` on its own domain and needs nothing rebuilt.
@@ -186,6 +193,11 @@ Transfer images with `docker save` / `docker load` instead of `docker login` +
 `pull`. Set `EXTERNAL_FONTS=off`, leave AI unconfigured, and point SMTP at an
 internal relay — see [§6](#6-networking) and
 [production-deployment.md](./production-deployment.md#air-gapped-and-no-egress-installs).
+
+`docker save` does not carry the signatures. Check them on the connected side before you
+save, or move the images with `cosign save` and check the copy offline with
+`cosign verify --local-image`: see
+[Checking without internet access](./production-deployment.md#checking-without-internet-access).
 
 ---
 
@@ -209,7 +221,7 @@ the VM then needs no public IP. Ports 3200 and 5432 stay on the Docker network.
 
 | Destination | Port | For | When |
 |---|--:|---|---|
-| `ghcr.io`, `pkg-containers.githubusercontent.com` | 443 | Images and updates | Always, unless side-loaded |
+| `ghcr.io`, `pkg-containers.githubusercontent.com` | 443 | Images and updates | Always, unless side-loaded or pulled from your own registry |
 | `github.com`, `*.githubusercontent.com` | 443 | Release files (compose file, scripts) | Install and updates; or copy them over by hand |
 | `acme-v02.api.letsencrypt.org` | 443 | TLS certificates | Caddy or Certbot |
 | Your SMTP relay | 25, 465, 587 | Email | If notifications are used |
@@ -234,8 +246,10 @@ The product's own UI fonts are always served from the host.
   speak plain HTTP on loopback / the bridge only.
 - Forward to `http://127.0.0.1:${APP_PORT}` (default 8081 — left off 80 so the reverse proxy itself can bind port 80).
   Application Gateway forwards to the VM's private IP on the same port instead.
-- Set `client_max_body_size 200M` (or the proxy equivalent) — matches the Nginx
-  limit inside the frontend container for uploads. On Application Gateway that is
+- Set `client_max_body_size 10240M` (or the proxy equivalent) — matches the Nginx
+  limit inside the frontend container, which is the largest upload limit a super-user
+  can configure. A lower value here silently caps every upload limit set in the app,
+  and the refusal it causes names no limit. On Application Gateway that is
   the WAF file upload limit, if the WAF is enabled.
 - Allow a **120 s** upstream timeout — matches the frontend's Nginx. Application
   Gateway's default backend timeout is 20 s, too short for SCORM imports and AI calls.
@@ -245,8 +259,13 @@ The product's own UI fonts are always served from the host.
 - Recommended: TLS 1.2+ only, HSTS, OCSP stapling, HTTP-to-HTTPS redirect.
 - `CORS_ORIGIN` and `PORTAL_BASE_URL` must be the **exact** public `https://`
   origin (scheme + host, no trailing slash).
+- **Two host names, one certificate each or one covering both**: the app's, and
+  `CONTENT_HOST`, which serves SCORM and HTML packages apart from the app. The proxy
+  forwards both to the same port and must pass the `Host` header through unchanged: the
+  app tells the two apart by it. See
+  [Content origin](./production-deployment.md#content-origin).
 
-Caddy config is a two-line `Caddyfile`; Nginx + Certbot config and the Application
+Caddy config is a three-line `Caddyfile`; Nginx + Certbot config and the Application
 Gateway settings are in
 [production-deployment.md](./production-deployment.md#reverse-proxy--https).
 
@@ -277,7 +296,7 @@ Requires Compose v2 + cgroup v2, or the limits are ignored.
 
 | Volume | Mounted in | Holds |
 |---|---|---|
-| `afry_lms_postgres_data` | `db` | All relational data, **SCORM runtime state**, file metadata |
+| `afry_lms_postgres_data` | `db` | All relational data, **SCORM runtime state**, file metadata. After a [PostgreSQL major-version upgrade](./production-deployment.md#postgresql-major-version-upgrades), the name set in `docker-compose.override.yml`, such as `afry_lms_postgres_data_pg19` |
 | `afry_lms_uploads_data` | `backend` (read-write), `frontend` (read-only) | Images, audio, video, unpacked SCORM, in `public/` and `private/` |
 
 - A complete backup is **both** halves taken together — the DB stores UUIDs, the
@@ -310,7 +329,7 @@ Stored in `/srv/<deploy-dir>/.env` (mode 600, root-owned).
 | `FILE_TOKEN_SECRET` | `openssl rand -hex 32` | `rotate-secret.sh`: open links keep working; finish after 13 hours |
 | `SCORM_CONTEXT_SECRET` | `openssl rand -hex 32` | `rotate-secret.sh`: running courses keep tracking; finish after 1 hour |
 | `SMTP_ENCRYPTION_KEY` | `openssl rand -hex 32` | `rotate-secret.sh` re-encrypts stored SMTP passwords and AI keys. Replacing it without keeping the old value as `SMTP_ENCRYPTION_KEY_PREVIOUS` loses them |
-| `SUPERADMIN_EMAIL` / `_PASSWORD` | choose | First run only. Remove the password afterwards |
+| `SUPERADMIN_EMAIL` / `_PASSWORD` | choose | First run only. The password must be changed at the first sign-in; remove it afterwards |
 | Backup passphrase | strong random | Keep the old one for as long as the backups it encrypted are retained |
 
 Procedures, recommended cadence and the leaked-secret checklist:
@@ -318,7 +337,8 @@ Procedures, recommended cadence and the leaked-secret checklist:
 start on a placeholder, short or malformed secret, or the default database password.
 
 Other required non-secret vars: `GITHUB_REPOSITORY`, `CORS_ORIGIN`,
-`PORTAL_BASE_URL`, `APP_VERSION` (pin to a tag). Full reference:
+`PORTAL_BASE_URL`, `APP_VERSION` (pin to a tag). `REGISTRY` (default `ghcr.io`) is
+the registry host the images are pulled from. Full reference:
 [production-deployment.md](./production-deployment.md#environment-variables) and
 `env.prod.example`.
 
@@ -328,7 +348,7 @@ Other required non-secret vars: `GITHUB_REPOSITORY`, `CORS_ORIGIN`,
 
 | Service | For | Notes |
 |---|---|---|
-| **DNS** | Reaching the app | A / AAAA record to the host, or to Application Gateway |
+| **DNS** | Reaching the app | Two A / AAAA records, the app's name and `CONTENT_HOST`, to the host or to Application Gateway |
 | **SMTP relay** | Email notifications | Per organization or system-wide, entered in the app |
 | **Mistral AI** | Maestro | Optional |
 | **Offsite backup target** | Disaster recovery | Any rsync-over-SSH path |
@@ -357,8 +377,8 @@ Design the capacity plan around **one backend instance**:
 
 | Check | How |
 |---|---|
-| Liveness | `curl localhost:8081/api/version`, or `/health` inside the backend container |
-| Version | `/api/version` returns the app version and the applied migration |
+| Liveness | `curl -f localhost:8081/api/health`: 200 when the backend reaches the database, 500 when it does not. `/health` inside the backend container checks the process only |
+| Version | `/api/version` returns the app version and the applied migration. It always answers 200; `"db": null` means the database is unreachable |
 | Crashes, OOM | `docker compose ps -a`, `docker inspect` (`OOMKilled`) |
 | Logs | `docker compose logs` (JSON). Cap the Docker log driver so logs cannot fill the disk |
 | Resource use | `docker stats` |
@@ -372,14 +392,15 @@ Design the capacity plan around **one backend instance**:
 - [ ] Linux host, systemd + cgroup v2, 64-bit, sized per [§2](#2-host-hardware)
 - [ ] Docker Engine 24+ and Compose v2 (`docker compose version`)
 - [ ] Dedicated data disk: LUKS-formatted, mounted, Docker `data-root` repointed — **before first `up`**
-- [ ] DNS A/AAAA record resolves to the host (or to the Application Gateway)
+- [ ] DNS A/AAAA records for the app's name and `CONTENT_HOST` resolve to the host (or to the Application Gateway), and the proxy holds a certificate for both
 - [ ] Firewall: 443 inbound; 80 inbound only if using ACME HTTP-01; 22 source-restricted; app port **not** public (with Application Gateway: app port open to the gateway subnet only)
-- [ ] Reverse proxy installed and forwarding to `127.0.0.1:APP_PORT`, or Application Gateway configured (120 s timeout, `/api/version` probe)
+- [ ] Reverse proxy installed and forwarding to `127.0.0.1:APP_PORT`, or Application Gateway configured (120 s timeout, `/api/health` probe)
 - [ ] `TRUST_PROXY` matches the number of proxies (default `2`)
 - [ ] Outbound egress allowed to `ghcr.io` and `github.com` (+ Let's Encrypt / SMTP / Mistral / `fonts.bunny.net` as applicable)
-- [ ] Pull token received from the AFRY LMS team; `docker login ghcr.io` done
+- [ ] Pull token received from the AFRY LMS team; `docker login ghcr.io` done (or `REGISTRY` set and `docker login` done for your own registry)
 - [ ] `.env` completed; `JWT_SECRET`, `FILE_TOKEN_SECRET`, `SCORM_CONTEXT_SECRET`, `SMTP_ENCRYPTION_KEY`, `POSTGRES_PASSWORD` generated; file `chmod 600`
 - [ ] `APP_VERSION` pinned to a release tag
+- [ ] `cosign.pub` kept from the first release; images checked with `cosign verify` (optional)
 - [ ] `/root/.backup-passphrase` set (mode 600); `/srv/backups` created; `OFFSITE_DEST` reachable
 - [ ] `BACKEND_MEMORY` raised to `1G`+ if certificate PDFs will be used
 - [ ] SMTP relay details ready (if notifications); Mistral key ready (if AI)
