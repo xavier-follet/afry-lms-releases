@@ -23,8 +23,9 @@ no repository access is needed:
 Images are `ghcr.io/xavier-follet/afry-lms/<image>`, or a copy in your own registry set by
 `REGISTRY` (see [Using your own registry](./production-deployment.md#using-your-own-registry)). A **reverse proxy** you provide
 terminates TLS: Caddy or Nginx on the host, or Azure Application Gateway in front
-of the VM. Sign-in is stateless JWT, so there is **no Redis, session store or
-cache tier**. All persistent state lives in **two Docker volumes**.
+of the VM. A sign-in is a signed token plus a row in the database (`user_sessions`, so a
+sign-out takes effect at once), so there is **no Redis, session store or cache tier**
+beyond PostgreSQL. All persistent state lives in **two Docker volumes**.
 
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 260}}}%%
@@ -325,9 +326,10 @@ Stored in `/srv/<deploy-dir>/.env` (mode 600, root-owned).
 | Variable | Generate | Changing it later |
 |---|---|---|
 | `POSTGRES_PASSWORD` | strong random | `rotate-secret.sh POSTGRES_PASSWORD` changes the DB role and `.env` together |
-| `JWT_SECRET` | `openssl rand -hex 32` | `rotate-secret.sh`: nobody is signed out; finish after 7 days |
+| `JWT_SECRET` | `openssl rand -hex 32` | `rotate-secret.sh`: nobody is signed out; finish after the session lifetime (12 hours by default, 30 days at most) |
 | `FILE_TOKEN_SECRET` | `openssl rand -hex 32` | `rotate-secret.sh`: open links keep working; finish after 13 hours |
 | `SCORM_CONTEXT_SECRET` | `openssl rand -hex 32` | `rotate-secret.sh`: running courses keep tracking; finish after 1 hour |
+| `MFA_TOTP_ENCRYPTION_KEY` | `openssl rand -hex 32` | Optional: without it, two-step verification is off. `rotate-secret.sh MFA_TOTP_ENCRYPTION_KEY` re-encrypts the stored authenticator seeds. If it is lost, the backend refuses to start while anything depends on it: see "If the two-step verification key is lost" in the production deployment guide |
 | `SMTP_ENCRYPTION_KEY` | `openssl rand -hex 32` | `rotate-secret.sh` re-encrypts stored SMTP passwords and AI keys. Replacing it without keeping the old value as `SMTP_ENCRYPTION_KEY_PREVIOUS` loses them |
 | `SUPERADMIN_EMAIL` / `_PASSWORD` | choose | First run only. The password must be changed at the first sign-in; remove it afterwards |
 | Backup passphrase | strong random | Keep the old one for as long as the backups it encrypted are retained |

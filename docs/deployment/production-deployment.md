@@ -116,6 +116,8 @@ CORS_ORIGIN=https://yourdomain.com
 CONTENT_HOST=content.yourdomain.com
 # Needed for email or AI. Leave it empty if you use neither, never as the placeholder
 SMTP_ENCRYPTION_KEY=<output of: openssl rand -hex 32>
+# Needed for two-step verification (authenticator apps). Leave it empty and the feature is off
+MFA_TOTP_ENCRYPTION_KEY=<output of: openssl rand -hex 32>
 ```
 
 > **Upgrading an existing install?** Add `SCORM_CONTEXT_SECRET` to `.env` before running `docker compose up -d` on the new release. Compose stops with an error if it is missing, and nothing on the running stack changes.
@@ -158,7 +160,7 @@ covers hosts without internet):
 docker pull "$(grep -o 'alpine:[0-9.]*@sha256:[0-9a-f]*' scripts/backup.sh)"
 ```
 
-On first start, PostgreSQL creates an empty database. The `migrate` service then builds the schema by applying every migration in order (starting from `0001_initial_schema.sql`), and the backend starts only after it has finished. There is no seed data: the backend creates the superadmin from `SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD` if none exists yet. That password works once: the first sign-in with it goes straight to **Set a new password**, and the account must choose its own before it gets in. The backend log says `Superadmin created` only when it actually created the account; if the email already belongs to a user who is not a super-user, it logs a warning and creates nothing. Every later `docker compose up` runs `migrate` again, which applies only the migrations that are new.
+On first start, PostgreSQL creates an empty database. The `migrate` service then builds the schema by applying every migration in order (starting from `0001_initial_schema.sql`), and the backend starts only after it has finished. There is no seed data (unless you have a [customer seed](#customer-seeds)): the backend creates the superadmin from `SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD` if none exists yet. That password works once: the first sign-in with it goes straight to **Set a new password**, and the account must choose its own before it gets in. The backend log says `Superadmin created` only when it actually created the account; if the email already belongs to a user who is not a super-user, it logs a warning and creates nothing. Every later `docker compose up` runs `migrate` again, which applies only the migrations that are new. A customer seed must be in place before this first start.
 
 ### 6. Verify
 
@@ -171,6 +173,66 @@ curl -f http://localhost:8081/api/health # → {"status":"ok"}
 `/api/version` always answers 200; `"db": null` there means the backend cannot reach the database. For a check that depends only on the status code (a load-balancer probe, a monitoring tool), use `/api/health`: 200 when the database answers, 500 when it does not or takes more than 3 seconds.
 
 The backend's port 3200 is not published to the host, so check it through the frontend on `APP_PORT`. That also proves the Nginx-to-backend proxy works. A `migrate` container with a non-zero exit code means a migration failed, and the backend will not have started: see `docker compose logs migrate`.
+
+---
+
+## Customer seeds
+
+Some installations come with a **customer seed**: SQL that AFRY LMS writes for one customer,
+such as creating their organizations. It is never in the images, which every customer pulls,
+and never in the public release files. AFRY LMS sends it to that customer's install technician
+directly, as a folder named for the customer:
+
+```
+customer-seeds/
+  ACME/
+    install.sql   runs once, on the first install only
+    update.sql    runs on the first install after install.sql, then once per new release
+```
+
+Either file may be missing. A seed may, for instance, preset a permanent banner (#671):
+
+```sql
+INSERT INTO system_message (active, body, language, display, audience, dismissible)
+VALUES (TRUE, '<p>This tool is accredited for information up to and including COMPANY CONFIDENTIAL</p>',
+        'en', 'banner', 'everyone', FALSE);
+```
+
+There can be many system messages, so a seed inserts its own; an `update.sql` that changes
+one must find it by something it set, such as its text, and leave the others alone. The text
+(`body`, HTML) is required; the title is optional.
+
+To use them:
+
+1. Put the `customer-seeds` folder in `/srv/afry_lms`, next to `docker-compose.yml`. Compose
+   mounts it, read-only, into the `migrate` service and nowhere else.
+2. Set `CUSTOMER` in `.env` to the folder's name, exactly as written (`CUSTOMER=ACME`).
+3. Run `docker compose up -d` as usual. The `migrate` service applies the seeds after the
+   database migrations.
+
+When each one runs:
+
+- **`install.sql`** runs only on the run that creates the database, and never again. It does
+  not run on an existing installation that sets `CUSTOMER` later, nor when the file is added
+  afterwards. Put both in place **before** the first `docker compose up`. If it fails, the
+  retry runs it again, until it has succeeded once.
+- **`update.sql`** runs whenever the release (`APP_VERSION`) or `CUSTOMER` differs from its
+  last run. It runs again on every upgrade, so whatever it does must be safe to do twice.
+  When AFRY LMS sends a new version of it, replace the file before
+  [updating the application](#updating-the-application).
+
+A seed that fails stops `migrate` like a failed migration: nothing from that file is kept,
+the backend does not start, and `docker compose logs migrate` reads
+`Customer seed ACME/update.sql failed: …`. `migrate` also stops, before any migration, on
+a `CUSTOMER` with anything but letters, digits, `-` or `_`, and on a `CUSTOMER` whose folder is
+not in `customer-seeds/` (misplaced, or spelt differently): otherwise the one first install
+would pass without its seed.
+
+To see what ran, and on which release:
+
+```bash
+docker compose exec postgres psql -U afry_lms afry_lms_db -c 'SELECT * FROM customer_seeds'
+```
 
 ---
 
@@ -206,6 +268,35 @@ CONTENT_HOST=content.yourdomain.com
 > super-user's account by getting them to open a page. Choose this only for an installation
 > where every package uploaded to it comes from someone you trust. The backend logs a
 > warning at every start while it is empty.
+
+---
+
+## Organization host names
+
+A super-user can give an organization host names of its own on its edit page (**Host names**),
+such as `customer1.yourdomain.com`. Opening one lands participants on that organization's
+portal, only its own users can sign in there, and its emails link to the host chosen under
+**Email links**. The back office stays at `/admin` on every host. The full behaviour is in the
+manual, under "Managing organizations".
+
+The application does the mapping. Getting the request to it is your part, once per host name:
+
+1. **DNS**: an A record pointing the name at the server, like the app's own.
+2. **Reverse proxy**: add the name to the proxy's site and to its certificate. With Caddy, list
+   it beside the others (`yourdomain.com, content.yourdomain.com, customer1.yourdomain.com`);
+   with Certbot, run it again with an extra `-d customer1.yourdomain.com`; on Application
+   Gateway, add a listener and certificate for it.
+3. **Forward the `Host` header unchanged.** The backend decides by host name, so a proxy that
+   rewrites it to `localhost` makes every host the standard one. The Nginx example below already
+   sets `proxy_set_header Host $host`; Caddy does it by default; on Application Gateway leave
+   **Override with new host name** off in the backend settings.
+
+Register the name in the application **after** it answers: the organization's emails link to
+it from the moment it is registered. Until then, an unregistered host simply behaves like the
+standard address. A wildcard record and certificate (`*.yourdomain.com`) save step 1 and 2
+for every later customer, but each host name is still registered one by one in the application.
+Emails keep `PORTAL_BASE_URL`'s scheme and port and swap in the organization's host name, so
+every registered host must answer on the same scheme and port as `PORTAL_BASE_URL`.
 
 ---
 
@@ -707,7 +798,7 @@ Password rules are set in the product, not here.
 ### How the overlap works
 
 The backend reads each of `JWT_SECRET`, `FILE_TOKEN_SECRET`, `SCORM_CONTEXT_SECRET` and
-`SMTP_ENCRYPTION_KEY` together with an optional `<NAME>_PREVIOUS`. It signs and encrypts
+`SMTP_ENCRYPTION_KEY` and `MFA_TOTP_ENCRYPTION_KEY` together with an optional `<NAME>_PREVIOUS`. It signs and encrypts
 with the new value only, but still accepts the previous one. A rotation therefore has two
 steps:
 
@@ -723,6 +814,7 @@ steps:
 | `FILE_TOKEN_SECRET` | Links to private files and documents, HTML package addresses, SCORM package access | 13 hours (an HTML package address lasts up to 13 hours) |
 | `SCORM_CONTEXT_SECRET` | Running SCORM launches | 1 hour |
 | `SMTP_ENCRYPTION_KEY` | Stored SMTP passwords and AI keys | Straight away, once re-encryption succeeds |
+| `MFA_TOTP_ENCRYPTION_KEY` | Stored seeds of authenticator apps (two-step verification) | Straight away, once re-encryption succeeds |
 
 ### With the script
 
@@ -751,6 +843,10 @@ sudo bash scripts/rotate-secret.sh SCORM_CONTEXT_SECRET
 sudo bash scripts/rotate-secret.sh SMTP_ENCRYPTION_KEY
 sudo bash scripts/rotate-secret.sh SMTP_ENCRYPTION_KEY --finish
 
+# Two-step verification key: the same, for the stored authenticator seeds
+sudo bash scripts/rotate-secret.sh MFA_TOTP_ENCRYPTION_KEY
+sudo bash scripts/rotate-secret.sh MFA_TOTP_ENCRYPTION_KEY --finish
+
 # Database password: changes the role and .env together
 sudo bash scripts/rotate-secret.sh POSTGRES_PASSWORD
 ```
@@ -765,7 +861,7 @@ Each run:
   started and reached the database. If it does not within `HEALTH_TIMEOUT`, the script
   restores `.env`, restarts the backend on the old values and tells you where to look.
 
-For `SMTP_ENCRYPTION_KEY`, the script lists any stored secret that neither key can read and
+For `SMTP_ENCRYPTION_KEY` and `MFA_TOTP_ENCRYPTION_KEY`, the script lists any stored secret that neither key can read and
 leaves it as it is. That happens if a value was saved under an even older key, or is
 damaged. Re-enter it in the back office, then finish the rotation. In this case `.env` is
 not restored: both keys stay configured, so nothing stops working in the meantime.
@@ -779,12 +875,12 @@ when it creates a new, empty database.
 
 ### By hand
 
-**For `JWT_SECRET`, `FILE_TOKEN_SECRET`, `SCORM_CONTEXT_SECRET` and `SMTP_ENCRYPTION_KEY`:**
+**For `JWT_SECRET`, `FILE_TOKEN_SECRET`, `SCORM_CONTEXT_SECRET`, `SMTP_ENCRYPTION_KEY` and `MFA_TOTP_ENCRYPTION_KEY`:**
 
 1. In `.env`, add `<NAME>_PREVIOUS=` with the current value, and replace `<NAME>` with the
    output of `openssl rand -hex 32`.
 2. Run `docker compose up -d --no-deps backend`, then `docker compose restart frontend`.
-3. For `SMTP_ENCRYPTION_KEY` only, run
+3. For `SMTP_ENCRYPTION_KEY` or `MFA_TOTP_ENCRYPTION_KEY` (it re-encrypts both), run
    `docker compose exec backend node packages/backend/src/db/reencrypt-secrets-cli.js`.
    It reports how many secrets it re-encrypted and exits non-zero if any could not be read.
 4. After the wait in the table above, delete the `<NAME>_PREVIOUS` line and repeat step 2.
@@ -829,9 +925,13 @@ Assume whoever has it can use it, and skip the overlap:
 1. Rotate `JWT_SECRET`, `FILE_TOKEN_SECRET` and `SCORM_CONTEXT_SECRET`, and run each one's
    `--finish` straight away. Everyone is signed out, which is the point: a leaked
    `JWT_SECRET` lets anyone mint a session for any user.
-2. Rotate `SMTP_ENCRYPTION_KEY` and finish it.
+2. Rotate `SMTP_ENCRYPTION_KEY` and finish it. If two-step verification is in use, rotate
+   `MFA_TOTP_ENCRYPTION_KEY` and finish it too.
 3. If the database or a backup may also have leaked, the stored SMTP passwords and AI keys
    are exposed too. Change them at the providers and enter the new ones in the back office.
+   The stored authenticator seeds are exposed as well, if `MFA_TOTP_ENCRYPTION_KEY` leaked
+   with them: reset two-step verification for the people who have it on (each user's edit
+   page, or `npm run mfa:reset`), and they set up a new authenticator.
 4. Rotate `POSTGRES_PASSWORD`.
 5. Ask super-users and administrators to change their passwords. An administrator can also
    send a reset email to any active user they manage, from the user's page. A completed
@@ -840,6 +940,44 @@ Assume whoever has it can use it, and skip the overlap:
 6. Review the audit trail under **System > Logs** for the period in question.
 7. Replace the GHCR token, and start a new backup passphrase for future backups.
 
+### If the two-step verification key is lost
+
+`MFA_TOTP_ENCRYPTION_KEY` is the only thing that can read the stored authenticator seeds.
+Without it the backend cannot check a code, and the two ways to carry on anyway are to lock
+everyone out or to let them in on a password alone, so it does neither: it refuses to start
+(see [Startup checks](#startup-checks)), and the log says which of a policy, an organization
+and enrolled users depends on the key. In order of preference:
+
+1. **Restore the key** from wherever `.env` is backed up. Nothing else is needed.
+2. **The key is gone for good, and people should set it up again.** Set a new
+   `MFA_TOTP_ENCRYPTION_KEY`, and remove every stored seed so no one is left with one the new
+   key cannot read:
+
+   ```bash
+   docker compose exec postgres psql -U afry_lms -d afry_lms_db \
+     -c "DELETE FROM user_recovery_codes; DELETE FROM mfa_challenges; DELETE FROM user_totp;"
+   ```
+
+   Run `docker compose up -d --no-deps backend`. Everyone signs in on the password alone,
+   and sets it up again where a policy or organization requires it.
+3. **Give up two-step verification.** Clear what requires it, then start without a key:
+
+   ```bash
+   docker compose exec postgres psql -U afry_lms -d afry_lms_db \
+     -c "UPDATE system_password_policy SET mfa_policy = 'optional'; UPDATE organizations SET mfa_required = FALSE; DELETE FROM user_recovery_codes; DELETE FROM mfa_challenges; DELETE FROM user_totp;"
+   ```
+
+For one person who has lost their phone, no key change is needed. Another super-user or an
+administrator of their organization resets them on the user's edit page. If the only
+super-user is locked out, run this on the server:
+
+```bash
+docker compose exec backend node packages/backend/src/db/mfa-reset-cli.js --email them@example.com
+```
+
+It removes that user's authenticator and recovery codes and signs them out everywhere, and
+records the reset in the audit trail with no actor.
+
 ### Startup checks
 
 In production, the backend refuses to start, and logs why, when:
@@ -847,11 +985,17 @@ In production, the backend refuses to start, and logs why, when:
 - `JWT_SECRET`, `FILE_TOKEN_SECRET` or `SCORM_CONTEXT_SECRET` is missing, shorter than 32
   characters, or still the `CHANGE_ME` placeholder from `env.prod.example`
 - `SMTP_ENCRYPTION_KEY` or `SMTP_ENCRYPTION_KEY_PREVIOUS` is set but is not 64 hex characters
+- `MFA_TOTP_ENCRYPTION_KEY` or `MFA_TOTP_ENCRYPTION_KEY_PREVIOUS` is set but is not 64 hex characters
 - a `<NAME>_PREVIOUS` equals its `<NAME>`, or is set without it
 - `POSTGRES_PASSWORD` is `secret` (the development default, which compose substitutes when
   `.env` sets none) or the placeholder
 
 A value counts as the placeholder when it contains `CHANGE_ME`, in any case.
+
+In every environment, the backend also refuses to start when `MFA_TOTP_ENCRYPTION_KEY` is
+empty but something depends on it: a sign-in policy or an organization that requires
+two-step verification, or a user who has set it up. See [If the two-step verification key is
+lost](#if-the-two-step-verification-key-is-lost).
 
 Read the reason with `docker compose logs backend`.
 
@@ -892,11 +1036,13 @@ while `JWT_SECRET`, `FILE_TOKEN_SECRET` or `SCORM_CONTEXT_SECRET` is missing.
 |---|---|---|
 | `APP_VERSION` | `latest` | Image tag to run. Pin it, e.g. `v1.2.3` |
 | `REGISTRY` | `ghcr.io` | Registry host the images are pulled from. See [Using your own registry](#using-your-own-registry) |
+| `CUSTOMER` | none | Name of the customer-seeds folder to apply. See [Customer seeds](#customer-seeds) |
 | `APP_PORT` | `8081` | Host port of the app, on `127.0.0.1`. Kept off 80 for the reverse proxy |
 | `POSTGRES_USER` | `afry_lms` | Database user |
 | `POSTGRES_DB` | `afry_lms_db` | Database name |
 | `SMTP_ENCRYPTION_KEY` | none | Encrypts stored SMTP passwords and the AI key. Needed for email or AI ¹ |
-| `JWT_SECRET_PREVIOUS`, `FILE_TOKEN_SECRET_PREVIOUS`, `SCORM_CONTEXT_SECRET_PREVIOUS`, `SMTP_ENCRYPTION_KEY_PREVIOUS` | none | The old value during a rotation. Set and removed by `rotate-secret.sh`. See [Rotating secrets](#rotating-secrets) |
+| `MFA_TOTP_ENCRYPTION_KEY` | none | Encrypts the stored seeds of authenticator apps. Needed for two-step verification: without it the feature is off. Once anyone uses it, or a policy requires it, it must stay set ⁵ |
+| `JWT_SECRET_PREVIOUS`, `FILE_TOKEN_SECRET_PREVIOUS`, `SCORM_CONTEXT_SECRET_PREVIOUS`, `SMTP_ENCRYPTION_KEY_PREVIOUS`, `MFA_TOTP_ENCRYPTION_KEY_PREVIOUS` | none | The old value during a rotation. Set and removed by `rotate-secret.sh`. See [Rotating secrets](#rotating-secrets) |
 | `EXTERNAL_FONTS` | `bunny` | `off` keeps font pickers to web-safe fonts. See [Air-gapped installs](#air-gapped-and-no-egress-installs) |
 | `DEFAULT_STORAGE_QUOTA_BYTES` | unlimited | Initial value of the default storage quota for organizations without their own. Read once ² |
 | `TRUST_PROXY` | `2` | Number of proxies in front of the backend ³ |
@@ -927,6 +1073,12 @@ logged and ignored, and the backend then trusts one hop.
 ⁴ Applies to both the login log and the audit trail under **System > Data
 Lifecycle Policies**. A window already stored below it is treated as this value.
 Anything but a whole number of 1 or more falls back to `30`.
+
+⁵ Rotate it with `scripts/rotate-secret.sh MFA_TOTP_ENCRYPTION_KEY`, which keeps the stored
+seeds readable and re-encrypts them. A different value with no `_PREVIOUS` makes every
+stored seed unreadable: the people who have two-step verification on can then no longer sign
+in until it is reset for them. See [Rotating secrets](#rotating-secrets) and
+[If the two-step verification key is lost](#if-the-two-step-verification-key-is-lost).
 
 ---
 
