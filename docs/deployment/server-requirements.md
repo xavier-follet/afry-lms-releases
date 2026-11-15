@@ -306,7 +306,7 @@ Requires Compose v2 + cgroup v2, or the limits are ignored.
   `/root/.backup-passphrase` (mode 600); keep a copy in a password manager.
 - Default schedule: daily `pg_dump` + uploads `tar` at 03:00, healthcheck 04:30,
   via `cron`. Retention 7 daily + 4 weekly. Optional `OFFSITE_DEST` (rsync/SSH).
-- Current targets: **RPO 24 h, RTO 2–4 h**. Revisit at first paying tenant.
+- Current targets: **RPO 24 h, RTO 2–4 h**. Tighten them if a customer's contract needs it.
 
 Full procedure: [backup-and-recovery.md](./backup-and-recovery.md).
 

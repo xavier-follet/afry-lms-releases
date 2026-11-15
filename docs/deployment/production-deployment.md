@@ -194,7 +194,7 @@ Either file may be missing. A seed may, for instance, preset a permanent banner 
 
 ```sql
 INSERT INTO system_message (active, body, language, display, audience, dismissible)
-VALUES (TRUE, '<p>This tool is accredited for information up to and including COMPANY CONFIDENTIAL</p>',
+VALUES (TRUE, '<p>This system is for authorised use only. Activity may be logged.</p>',
         'en', 'banner', 'everyone', FALSE);
 ```
 

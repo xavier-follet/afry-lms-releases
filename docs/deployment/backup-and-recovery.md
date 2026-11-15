@@ -316,8 +316,8 @@ A same-host recovery (data corruption, not host loss) is faster — roughly
 **30–60 min**, since the images and volumes already exist and only `restore.sh`
 runs.
 
-These targets suit the current pre-release stage. **Revisit at GA / first paying
-tenant** — a paying B2B customer will likely require a tighter RPO (see §13).
+These targets are the current defaults. **Tighten them when a customer's
+contract needs a lower RPO** (see §13).
 
 ## 12. Appendix A — Encryption at rest
 
@@ -339,11 +339,11 @@ would enable PostgreSQL **WAL archiving / PITR**:
 - recovery via `restore_command` + `recovery_target_time`.
 
 This adds always-on moving parts that conflict with the simple, manual,
-image-based deployment posture and is **not warranted before there is paying-customer
-data**. Note also that **file backups have no PITR equivalent** here: even with
+image-based deployment posture and is **not warranted until a customer's contract
+needs it**. Note also that **file backups have no PITR equivalent** here: even with
 DB PITR, the uploads volume RPO would still be bounded by the daily file archive,
 so DB-only PITR has limited end-to-end value until file backup frequency also
-rises. Reconsider when the first production tenant onboards or a contractual RPO
+rises. Reconsider when a contractual RPO
 below 24 h is required.
 
 ## 14. Troubleshooting
