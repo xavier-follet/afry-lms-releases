@@ -202,6 +202,41 @@ There can be many system messages, so a seed inserts its own; an `update.sql` th
 one must find it by something it set, such as its text, and leave the others alone. The text
 (`body`, HTML) is required; the title is optional.
 
+### Rewording back-office texts
+
+A seed can replace any text of the back office (administration, editor and sign-in pages), per
+language, for the whole installation. Each row names a text by its **namespace**, the locale
+file it lives in (`admin`, `editor` or `common`, from
+`packages/frontend/src/i18n/locales/en/<namespace>.json`), and its **key**, the path to it in
+that file joined with dots: `{"users": {"pageTitle": "Users"}}` in `admin.json` is
+`admin` / `users.pageTitle`.
+
+Put them in `update.sql`, always as an upsert, so that changing a value in the file and shipping
+it with the next release replaces the old one:
+
+```sql
+INSERT INTO ui_copy_overrides (language, namespace, key, value) VALUES
+  ('en', 'admin', 'users.pageTitle', 'People'),
+  ('sv', 'admin', 'users.pageTitle', 'Personer')
+ON CONFLICT (language, namespace, key) DO UPDATE SET value = EXCLUDED.value;
+
+-- Removing a line above does not remove its row. Retire an override explicitly:
+DELETE FROM ui_copy_overrides
+ WHERE language = 'en' AND namespace = 'admin' AND key = 'users.oldKey';
+```
+
+- An override shows on the next page load, at most five minutes after it is written (browsers
+  cache the overrides that long). It applies to its own language only, and to every
+  language whose back office falls back to English when the override is in `en`. Back-office
+  languages are `en`, `sv`, `fr`, `de`, `es`, `da`, `fi`, `no`; an override in any other
+  language has no effect.
+- Keep placeholders such as `{{count}}` in the new text. Plural forms are separate keys
+  (`..._one`, `..._other`): override each.
+- Keys follow the code. A key renamed in a later release no longer matches, and its text goes
+  back to the shipped one without any error: check the overrides after each upgrade.
+- `update.sql` only runs on a new release. To apply a changed wording sooner, run the same
+  statements with `psql` against the database.
+
 To use them:
 
 1. Put the `customer-seeds` folder in `/srv/afry_lms`, next to `docker-compose.yml`. Compose
