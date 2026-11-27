@@ -46,7 +46,7 @@ flowchart TB
         frontend --> backend --> db
     end
 
-    out["<b>Outbound</b>, 443 unless noted<br/><br/><b>ghcr.io</b>: images, required<br/><b>SMTP relay</b>: 25, 465 or 587, if email<br/><b>api.mistral.ai</b>: if AI is on<br/><b>fonts.bunny.net</b>: optional<br/><b>Let’s Encrypt</b>: Caddy / Certbot only"]
+    out["<b>Outbound</b>, 443 unless noted<br/><br/><b>ghcr.io</b>: images, required<br/><b>SMTP relay</b>: 25, 465 or 587, if email<br/><b>api.mistral.ai</b>: if AI is on<br/><b>login.microsoftonline.com</b>, <b>graph.microsoft.com</b>: if single sign-on is on<br/><b>fonts.bunny.net</b>: optional<br/><b>Let’s Encrypt</b>: Caddy / Certbot only"]
 
     users --> proxy
     users --> agw
@@ -163,7 +163,7 @@ database.
 |---|---|---|---|--:|
 | `db` | `postgres:18` (Debian) | PostgreSQL 18, nothing added | `postgres` | 5432 |
 | `backend` | `node:24-alpine` | Node.js 24, Chromium for PDFs, no `npm` | `node` | 3200 |
-| `frontend` | `nginx-unprivileged:stable-alpine` | Nginx (current stable branch), the built SPAs | `nginx` (101) | 8080 |
+| `frontend` | `nginx-unprivileged:mainline-alpine` | Nginx (current mainline branch), the built SPAs | `nginx` (101) | 8080 |
 
 - Backend and frontend run as non-root. All three are built for **`linux/amd64`
   and `linux/arm64`**.
@@ -227,10 +227,16 @@ the VM then needs no public IP. Ports 3200 and 5432 stay on the Docker network.
 | `acme-v02.api.letsencrypt.org` | 443 | TLS certificates | Caddy or Certbot |
 | Your SMTP relay | 25, 465, 587 | Email | If notifications are used |
 | `api.mistral.ai` | 443 | Maestro, the AI agent | If AI is on |
+| `login.microsoftonline.com` | 443 | Single sign-on: sign-in, signing keys, tokens | If single sign-on is on |
+| `graph.microsoft.com` | 443 | Single sign-on: user sync by pull | If single sign-on uses user sync by pull |
 | `fonts.bunny.net` | 443 | Author-chosen web fonts | Unless `EXTERNAL_FONTS=off` |
 | NTP | 123/udp | Clock sync | Always |
 
 The product's own UI fonts are always served from the host.
+
+User sync by push (SCIM) is the one call from outside: Microsoft's provisioning service reaches
+`/api/scim/v2` on the app's public address. Where a firewall is in the way, allow the
+`AzureActiveDirectory` service tag ranges Microsoft publishes.
 
 ### Internal
 
@@ -399,6 +405,7 @@ Design the capacity plan around **one backend instance**:
 - [ ] Reverse proxy installed and forwarding to `127.0.0.1:APP_PORT`, or Application Gateway configured (120 s timeout, `/api/health` probe)
 - [ ] `TRUST_PROXY` matches the number of proxies (default `2`)
 - [ ] Outbound egress allowed to `ghcr.io` and `github.com` (+ Let's Encrypt / SMTP / Mistral / `fonts.bunny.net` as applicable)
+- [ ] If single sign-on is used: egress to `login.microsoftonline.com` (and `graph.microsoft.com` for user sync by pull), and `PORTAL_BASE_URL` is the public https address
 - [ ] Pull token received from the AFRY LMS team; `docker login ghcr.io` done (or `REGISTRY` set and `docker login` done for your own registry)
 - [ ] `.env` completed; `JWT_SECRET`, `FILE_TOKEN_SECRET`, `SCORM_CONTEXT_SECRET`, `SMTP_ENCRYPTION_KEY`, `POSTGRES_PASSWORD` generated; file `chmod 600`
 - [ ] `APP_VERSION` pinned to a release tag

@@ -1082,7 +1082,9 @@ while `JWT_SECRET`, `FILE_TOKEN_SECRET` or `SCORM_CONTEXT_SECRET` is missing.
 | `DEFAULT_STORAGE_QUOTA_BYTES` | unlimited | Initial value of the default storage quota for organizations without their own. Read once ² |
 | `TRUST_PROXY` | `2` | Number of proxies in front of the backend ³ |
 | `LOG_RETENTION_MIN_DAYS` | `30` | Shortest log retention window a super-user may set ⁴ |
+| `INACTIVITY_PERIOD_MIN_DAYS` | `90` | Shortest period without a sign-in after which a super-user may have inactive accounts disabled or deleted, under **System > Data Lifecycle Policies**. A stored period below it is treated as this value |
 | `MANUAL_PURGE_ENABLED` | `true` | `false` removes **Purge all now** from **System > Data Lifecycle Policies** |
+| `SSO_ENABLED` | `false` | `true` makes **System > Sign-In Policies > Single sign-on** available, for sign-in with Microsoft Entra ID. A super-user switches it on there. Needs `SMTP_ENCRYPTION_KEY` ⁶ |
 | `SESSION_LIFETIME_HOURS` | `12` | How long a sign-in lasts, 1 to 720 hours. Default for **System > Sign-In Policies > Sessions**, where a value set wins |
 | `SESSION_IDLE_MINUTES` | `60` | Minutes without activity before someone is signed out. `0` turns it off, otherwise 5 to 1440. Default for the same page |
 | `*_CPUS`, `*_MEMORY` | see table | Container limits. See [Resource limits](#resource-limits) |
@@ -1114,6 +1116,16 @@ seeds readable and re-encrypts them. A different value with no `_PREVIOUS` makes
 stored seed unreadable: the people who have two-step verification on can then no longer sign
 in until it is reset for them. See [Rotating secrets](#rotating-secrets) and
 [If the two-step verification key is lost](#if-the-two-step-verification-key-is-lost).
+
+⁶ Single sign-on sends people to Microsoft and back, so `PORTAL_BASE_URL` must be the public
+https address people use: it is the redirect URI (`<address>/api/sso/callback`) registered in
+Entra. The backend needs outbound HTTPS to `login.microsoftonline.com`, and to
+`graph.microsoft.com` if user sync by pull is used. User sync by push (SCIM) is the one call
+from outside: Microsoft's provisioning service reaches `<address>/api/scim/v2`, so the app
+must be reachable from the internet for it. Where a firewall is in the way, Microsoft's
+guidance is to allow the `AzureActiveDirectory` service tag ranges. Super-users keep
+password sign-in at `/login`, so a wrong setup never locks everyone out. Setup steps are in the
+manual: **Single sign-on with Microsoft Entra ID**.
 
 ---
 
@@ -1212,6 +1224,37 @@ An SBOM is an inventory, not a verdict: it does not say an image is free of vuln
 Each release is scanned before it is published, and a HIGH or CRITICAL finding with a fix
 available stops it, but new vulnerabilities are found in old packages every day.
 
+### Scanning with the VEX
+
+Some findings cannot be reached in how AFRY LMS runs, either because no fix exists yet or
+because the fix has not reached a base image. Most of these are in the Debian base packages
+of the `db` image, such as XML or QUIC code that PostgreSQL never calls here. The AFRY LMS
+team assesses each one and records the result in a VEX document (OpenVEX), which is attached
+to every image as an attestation signed with the same key as the images. It is not a release
+file: it travels with the images.
+
+[Trivy](https://trivy.dev) applies it when you add `--vex oci`:
+
+```bash
+for img in db backend frontend; do
+  trivy image --vex oci --severity HIGH,CRITICAL "ghcr.io/xavier-follet/afry-lms/$img:v1.2.3"
+done
+```
+
+Findings the VEX covers drop out of the report; `--show-suppressed` lists them with their
+justification. To read the document itself, or to check it was signed by AFRY LMS:
+
+```bash
+cosign verify-attestation --key cosign.pub --insecure-ignore-tlog --type openvex \
+  ghcr.io/xavier-follet/afry-lms/db:v1.2.3 | jq -r '.payload' | base64 -d | jq '.predicate'
+```
+
+Each statement covers one CVE in named packages. When a fix ships, the next rebuild picks it
+up and the statement no longer matters. A finding the VEX does not cover is
+one the team has not assessed yet: report it through your usual contact. Images copied with
+`cosign save` and `cosign load` (see [Using your own registry](#using-your-own-registry))
+keep the attestation; `oras cp -r` does too.
+
 ### When the signing key changes
 
 - The private key is held by the AFRY LMS release team: in the release pipeline's secret
@@ -1245,7 +1288,7 @@ registry it can reach and point Compose at it. Images are pulled from
      cosign load --dir "$img" "$DST/$img:v1.2.3"
    done
    ```
-   This copies both architectures and the signatures, and keeps the digests, so
+   This copies both architectures, the signatures and the [VEX](#scanning-with-the-vex), and keeps the digests, so
    `digests.txt` still applies and the [signature check](#checking-the-signatures) works
    against your registry. Do not copy with `docker pull`, `docker tag` and `docker push`:
    that copies only your machine's architecture, gives the image a new digest, and leaves
@@ -1277,6 +1320,10 @@ the override file anyway.
 **A stock install makes no request to any external host.** Every font the product uses for
 itself — the back-office chrome and all nine portal template families — is served from your
 own container. There is nothing to configure for this and no way to turn it off.
+
+The one feature that talks to Microsoft by design is single sign-on. It is off unless
+`SSO_ENABLED=true`, and then it needs outbound HTTPS to `login.microsoftonline.com` (and to
+`graph.microsoft.com` for user sync by pull). It cannot work in an installation with no egress.
 
 One thing remains open-ended: a font a **course author** picks for a training theme, or an
 **organisation admin** picks for a portal, can be any family in existence, so it cannot be
